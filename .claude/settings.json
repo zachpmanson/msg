@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(~/projects/msg/msg --as wolf status*)",
+      "Bash(~/projects/msg/msg --as wolf check*)",
+      "Bash(~/projects/msg/msg status*)",
+      "Bash(~/projects/msg/msg check*)",
+      "Bash(curl *)",
+      "Bash(say *)"
+    ]
+  }
+}

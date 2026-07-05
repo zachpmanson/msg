@@ -1,0 +1,10 @@
+.env
+.env.*
+msg
+inbox*.jsonl
+seen_ids*.jsonl
+.inbox*.cursor
+.listen*.pid
+last_seen_time*
+downloads.*/
+!.env.example
