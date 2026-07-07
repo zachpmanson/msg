@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -10,9 +11,12 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
+
+	xnetws "golang.org/x/net/websocket"
 
 	"mellium.im/sasl"
 	"mellium.im/xmlstream"
@@ -23,6 +27,7 @@ import (
 	"mellium.im/xmpp/mux"
 	"mellium.im/xmpp/stanza"
 	"mellium.im/xmpp/upload"
+	"mellium.im/xmpp/websocket"
 )
 
 const receiptsNS = "urn:xmpp:receipts"
@@ -48,6 +53,72 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// proxyDial connects to target via an HTTP CONNECT proxy if HTTPS_PROXY (or
+// HTTP_PROXY) is set, otherwise dials directly.
+func proxyDial(ctx context.Context, target string) (net.Conn, error) {
+	proxyURL := os.Getenv("HTTPS_PROXY")
+	if proxyURL == "" {
+		proxyURL = os.Getenv("HTTP_PROXY")
+	}
+	if proxyURL == "" {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", target)
+	}
+
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing proxy URL %q: %w", proxyURL, err)
+	}
+
+	var d net.Dialer
+	proxyAddr := u.Host
+	if u.Port() == "" {
+		proxyAddr = u.Hostname() + ":80"
+	}
+
+	conn, err := d.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to proxy %s: %w", proxyAddr, err)
+	}
+
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: target},
+		Host:   target,
+		Header: make(http.Header),
+	}
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("writing CONNECT request: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("reading CONNECT response: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT returned %s", resp.Status)
+	}
+
+	// The bufio.Reader may have buffered bytes that arrived immediately after
+	// the 200 response (e.g. the XMPP server's opening stream). Wrap the conn
+	// so those bytes are replayed before reads go to the raw connection.
+	return &bufConn{Conn: conn, r: br}, nil
+}
+
+// bufConn wraps a net.Conn with a bufio.Reader so that any bytes already
+// buffered after an HTTP CONNECT exchange are not lost.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
 // connect dials and negotiates an XMPP client session for the given account.
 func connect(ctx context.Context, cfg *Config) (*xmpp.Session, jid.JID, error) {
 	j, err := jid.Parse(cfg.JID)
@@ -61,18 +132,81 @@ func connect(ctx context.Context, cfg *Config) (*xmpp.Session, jid.JID, error) {
 		xmpp.BindResource(),
 	}
 
-	if cfg.Server == "" {
-		session, err := xmpp.DialClientSession(ctx, j, features...)
+	// WebSocket path: use wss:// URL when XMPP_WEBSOCKET_URL is set.
+	// We establish TCP→proxy→TLS manually so we can force HTTP/1.1 via TLS
+	// ALPN. Many proxies negotiate HTTP/2 by default, and WebSocket upgrade
+	// (101 Switching Protocols) is not supported over HTTP/2.
+	if cfg.WebSocket != "" {
+		wsURL, err := url.Parse(cfg.WebSocket)
 		if err != nil {
-			return nil, jid.JID{}, err
+			return nil, jid.JID{}, fmt.Errorf("parsing XMPP_WEBSOCKET_URL: %w", err)
+		}
+		host := wsURL.Hostname()
+		port := wsURL.Port()
+		if port == "" {
+			port = "443"
+		}
+
+		// 1. TCP (possibly through an HTTP CONNECT proxy).
+		rawConn, err := proxyDial(ctx, host+":"+port)
+		if err != nil {
+			return nil, jid.JID{}, fmt.Errorf("tcp dial for websocket: %w", err)
+		}
+
+		// 2. TLS with http/1.1 forced via ALPN.
+		tlsConn := tls.Client(rawConn, &tls.Config{
+			ServerName: host,
+			NextProtos: []string{"http/1.1"},
+		})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, jid.JID{}, fmt.Errorf("tls handshake for websocket: %w", err)
+		}
+
+		// 3. WebSocket upgrade + XMPP session on the TLS conn.
+		// TLS is already provided by wss://, so omit StartTLS from features.
+		wsFeatures := []xmpp.StreamFeature{
+			xmpp.SASL("", cfg.Password, sasl.ScramSha256Plus, sasl.ScramSha256, sasl.ScramSha1Plus, sasl.ScramSha1, sasl.Plain),
+			xmpp.BindResource(),
+		}
+
+		// Perform the WebSocket handshake on our pre-established TLS connection.
+		origin := "https://" + host
+		wsCfg, err := xnetws.NewConfig(cfg.WebSocket, origin)
+		if err != nil {
+			tlsConn.Close()
+			return nil, jid.JID{}, fmt.Errorf("websocket config: %w", err)
+		}
+		wsCfg.Protocol = []string{websocket.WSProtocol}
+		wsConn, err := xnetws.NewClient(wsCfg, tlsConn)
+		if err != nil {
+			tlsConn.Close()
+			return nil, jid.JID{}, fmt.Errorf("websocket handshake: %w", err)
+		}
+
+		// Call xmpp.NewSession directly with xmpp.Secure explicitly set.
+		// websocket.NewSession auto-detects secure by checking
+		// LocalAddr().Scheme == "wss", but LocalAddr() returns the Origin
+		// URL ("https://..."), so the check fails. We set the bit ourselves.
+		n := websocket.Negotiator(func(*xmpp.Session, *xmpp.StreamConfig) xmpp.StreamConfig {
+			return xmpp.StreamConfig{Features: wsFeatures}
+		})
+		session, err := xmpp.NewSession(ctx, j.Domain(), j, wsConn, xmpp.Secure, n)
+		if err != nil {
+			wsConn.Close()
+			return nil, jid.JID{}, fmt.Errorf("websocket/xmpp session: %w", err)
 		}
 		return session, j, nil
 	}
 
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", cfg.Server)
+	target := cfg.Server
+	if target == "" {
+		target = j.Domain().String() + ":5222"
+	}
+
+	conn, err := proxyDial(ctx, target)
 	if err != nil {
-		return nil, jid.JID{}, fmt.Errorf("dialing %s: %w", cfg.Server, err)
+		return nil, jid.JID{}, fmt.Errorf("dialing %s: %w", target, err)
 	}
 	session, err := xmpp.NewClientSession(ctx, j, conn, features...)
 	if err != nil {
