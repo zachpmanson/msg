@@ -100,6 +100,11 @@ func usage() {
   msg listen                    run the background daemon that logs incoming messages
                                  (also joins XMPP_ROOM, if set)
   msg check                     print unread messages received since the last check
+  msg check --since <ts|date>   one-shot: print messages since an RFC3339 timestamp
+                                 or YYYY-MM-DD date, instead of the persisted cursor
+  msg check --in <seconds>      declare when the next check is expected, so presence
+                                 stays "available" for about that long
+  msg check --no-receipt        skip sending read-receipt markers for this check
   msg status                    show whether the listen daemon is running
   msg stop                      stop the listen daemon
 
@@ -394,9 +399,168 @@ func dataFile(name string) (string, error) {
 	return filepath.Join(dataDir(), name), nil
 }
 
+// defaultPollWindow is how long presence stays "available" after a `msg
+// check` that didn't declare its own --in, and is also the jitter buffer
+// added on top of a declared --in. It's set well above a typical agent poll
+// interval (the afk skill reschedules every ~60s) to absorb scheduling
+// jitter without flapping presence.
+const defaultPollWindow = 180 * time.Second
+
+// touchLastPoll records that `msg check` just ran and when the caller expects
+// to check again (inSeconds, or -1 if not declared via --in), so the listen
+// daemon's presence (see claudePresence) can reflect whether an agent is
+// actively polling right now rather than just whether the daemon process is
+// up. Best-effort: a failure here shouldn't block `msg check` from doing its
+// job.
+func touchLastPoll(inSeconds int) {
+	window := defaultPollWindow
+	if inSeconds > 0 {
+		window = time.Duration(inSeconds)*time.Second + defaultPollWindow
+	}
+	due := time.Now().Add(window).UTC().Format(time.RFC3339)
+	p, _ := dataFile("next_poll_due")
+	if err := os.WriteFile(p, []byte(due), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not record next poll time: %v\n", err)
+	}
+}
+
+// claudePresence reports the (show, status) the listen daemon should
+// announce, based on when the next `msg check` is due (see touchLastPoll).
+// With no record yet, or one already past, it reports extended-away rather
+// than available.
+func claudePresence() (string, string) {
+	p, _ := dataFile("next_poll_due")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return "xa", "not actively watched by Claude"
+	}
+	due, err := time.Parse(time.RFC3339, strings.TrimSpace(string(b)))
+	if err != nil || time.Now().After(due) {
+		return "xa", "not actively watched by Claude"
+	}
+	return "", "listening for messages"
+}
+
+// parseSince parses a --since value as either a full RFC3339 timestamp or a
+// bare date (YYYY-MM-DD, taken as that date's UTC midnight).
+func parseSince(spec string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, spec); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02", spec); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("--since %q: expected an RFC3339 timestamp or a YYYY-MM-DD date", spec)
+}
+
+// offsetAtOrAfter scans the inbox from the start and returns the byte offset
+// of the first message timestamped at or after cutoff (or the file size if
+// none is), so `msg check --since` can start from an arbitrary point in
+// history instead of the persisted cursor.
+func offsetAtOrAfter(inboxPath string, cutoff time.Time) (int64, error) {
+	f, err := os.Open(inboxPath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var offset int64
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		lineLen := int64(len(line)) + 1 // + the newline the scanner stripped
+		var m incoming
+		if err := json.Unmarshal(line, &m); err == nil {
+			if t, err := time.Parse(time.RFC3339, m.Time); err == nil && !t.Before(cutoff) {
+				return offset, nil
+			}
+		}
+		offset += lineLen
+	}
+	return offset, scanner.Err()
+}
+
+// lastMarkableMessage scans the inbox for the most recent direct, markable
+// chat message, so a poll that found no new messages can still re-send a
+// "displayed" heartbeat marker for it (see cmdCheck).
+func lastMarkableMessage(inboxPath string) (incoming, bool, error) {
+	f, err := os.Open(inboxPath)
+	if os.IsNotExist(err) {
+		return incoming{}, false, nil
+	}
+	if err != nil {
+		return incoming{}, false, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var last incoming
+	found := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		var m incoming
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			continue
+		}
+		if m.Markable && m.ID != "" && m.Type == "chat" {
+			last = m
+			found = true
+		}
+	}
+	return last, found, scanner.Err()
+}
+
 // cmdCheck prints any inbox lines appended since the last check and advances
 // the read cursor, so repeated calls only surface new messages.
+//
+// Flags:
+//
+//	--since <RFC3339|YYYY-MM-DD>   one-shot: read from this point in history
+//	                                instead of the persisted cursor. The
+//	                                cursor still advances to end-of-file
+//	                                afterward, so a later plain check won't
+//	                                replay this window again.
+//	--in <seconds>                 how long until the next check is expected;
+//	                                keeps presence "available" for roughly
+//	                                that long instead of the default window.
+//	--no-receipt                   skip sending XEP-0333 "displayed" markers
+//	                                for this check (both for newly-surfaced
+//	                                messages and the no-new-messages heartbeat).
 func cmdCheck(args []string) error {
+	var sinceSpec string
+	var receiptsOff bool
+	inSeconds := -1
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--since":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--since requires a value")
+			}
+			sinceSpec = args[i]
+		case "--no-receipt":
+			receiptsOff = true
+		case "--in":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--in requires a value")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("--in: invalid seconds %q: %w", args[i], err)
+			}
+			inSeconds = n
+		default:
+			return fmt.Errorf("unknown check argument %q", args[i])
+		}
+	}
+	touchLastPoll(inSeconds)
+
 	inboxPath, _ := dataFile("inbox.jsonl")
 	cursorPath, _ := dataFile(".inbox.cursor")
 
@@ -411,7 +575,16 @@ func cmdCheck(args []string) error {
 	defer f.Close()
 
 	var offset int64
-	if b, err := os.ReadFile(cursorPath); err == nil {
+	if sinceSpec != "" {
+		cutoff, err := parseSince(sinceSpec)
+		if err != nil {
+			return err
+		}
+		offset, err = offsetAtOrAfter(inboxPath, cutoff)
+		if err != nil {
+			return err
+		}
+	} else if b, err := os.ReadFile(cursorPath); err == nil {
 		offset, _ = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	}
 
@@ -468,8 +641,12 @@ func cmdCheck(args []string) error {
 		return err
 	}
 
-	if len(toAck) > 0 {
-		sendDisplayedMarkers(toAck)
+	if !receiptsOff {
+		if len(toAck) > 0 {
+			sendDisplayedMarkers(toAck)
+		} else if last, ok, err := lastMarkableMessage(inboxPath); err == nil && ok {
+			sendDisplayedMarkers([]incoming{last})
+		}
 	}
 	return nil
 }
@@ -756,7 +933,7 @@ func cmdListen(args []string) error {
 			if err := sendOnSession(ctx, session, cfg.To, "listening for your replies now."); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to send listening announcement: %v\n", err)
 			}
-		})
+		}, claudePresence)
 		if ctx.Err() != nil {
 			return nil
 		}

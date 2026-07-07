@@ -181,14 +181,17 @@ func sendRoomMessage(ctx context.Context, cfg *Config, body string) error {
 	return err
 }
 
-// sendPresence announces availability with a human-readable status, so a
+// sendPresence announces availability with a show state (e.g. "" for
+// available, "xa" for extended-away) and a human-readable status, so a
 // contact's roster shows more than just "online" — e.g. distinguishing the
-// daemon actually running from some other client being briefly connected.
-func sendPresence(ctx context.Context, session *xmpp.Session, status string) error {
+// daemon actually running from some other client being briefly connected,
+// or whether an agent is actively polling it right now.
+func sendPresence(ctx context.Context, session *xmpp.Session, show, status string) error {
 	p := struct {
 		XMLName xml.Name `xml:"presence"`
+		Show    string   `xml:"show,omitempty"`
 		Status  string   `xml:"status"`
-	}{Status: status}
+	}{Show: show, Status: status}
 	return session.Encode(ctx, p)
 }
 
@@ -386,21 +389,59 @@ type incoming struct {
 	Reactions    []string `json:"reactions,omitempty"`
 }
 
+// presenceRefresh is a small interval, well under the ~60-90s cadence an
+// agent's poll loop runs at, so a stale-vs-active transition is reflected in
+// presence promptly instead of only at the next reconnect.
+const presenceRefresh = 20 * time.Second
+
 // listen connects and invokes onMsg for every chat message with a non-empty
 // body until the context is canceled or the connection drops. If onConnected
 // is non-nil, it is called once the session is up (after presence is sent).
-func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected func(*xmpp.Session)) error {
+// If presenceFn is non-nil, it's called immediately and then every
+// presenceRefresh to decide the current (show, status) to announce — this is
+// how presence tracks whether an agent is actively polling `msg check`
+// rather than just whether the daemon process is up.
+func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected func(*xmpp.Session), presenceFn func() (show, status string)) error {
 	session, _, err := connect(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer session.Close()
 
+	// connCtx bounds the presence-refresh goroutine to this connection
+	// attempt, distinct from the "done" channel below (which the outer
+	// select also reads from — a second reader there would race to consume
+	// its one buffered value).
+	connCtx, cancelConn := context.WithCancel(ctx)
+	defer cancelConn()
+
+	show, status := "", "listening for messages"
+	if presenceFn != nil {
+		show, status = presenceFn()
+	}
 	// Announce availability (with a status so it's clear in a client's roster
 	// that this is the daemon, not just a bare online blip) so the server
 	// delivers messages to this resource.
-	if err := sendPresence(ctx, session, "listening for messages"); err != nil {
+	if err := sendPresence(ctx, session, show, status); err != nil {
 		return fmt.Errorf("sending presence: %w", err)
+	}
+	if presenceFn != nil {
+		go func() {
+			ticker := time.NewTicker(presenceRefresh)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-connCtx.Done():
+					return
+				case <-ticker.C:
+					show, status := presenceFn()
+					if err := sendPresence(ctx, session, show, status); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to refresh presence: %v\n", err)
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	if cfg.Room != "" {
