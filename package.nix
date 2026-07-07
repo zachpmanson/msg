@@ -7,7 +7,7 @@ buildGoModule {
 
   # vendorHash can't be known before the first build. Leave lib.fakeHash, run
   # `nix build .#msg`, and paste the "got: sha256-..." value it prints.
-  vendorHash = "sha256-np9NRRIC03CbzcMKzrpHesUkFCbZphnxLWRPcCp/4R0=";
+  vendorHash = "sha256-0sHUqGUvafjKPJamk8AqOZ1q8C6172ZEuiSDTypogp8=";
 
   meta = {
     description = "XMPP/Jabber messaging CLI";
