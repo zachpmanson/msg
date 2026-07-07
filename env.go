@@ -19,6 +19,12 @@ type Config struct {
 	// UploadService optionally overrides the XEP-0363 HTTP upload component
 	// JID, skipping disco discovery for send-file/room-file.
 	UploadService string
+
+	// WebSocket optionally sets a wss:// URL to connect via XMPP-over-WebSocket
+	// (RFC 7395) instead of a raw TCP connection. Useful when port 5222 is
+	// blocked but 443 is open (e.g. cloud sandbox environments).
+	// Example: wss://chat.example.com/ws
+	WebSocket string
 }
 
 func loadEnv(path string) (map[string]string, error) {
@@ -72,6 +78,7 @@ func loadConfig() (*Config, error) {
 		Nick:     vals["XMPP_NICK"],
 
 		UploadService: vals["XMPP_UPLOAD_SERVICE"],
+		WebSocket:     vals["XMPP_WEBSOCKET_URL"],
 	}
 
 	if cfg.JID == "" || cfg.Password == "" {

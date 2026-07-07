@@ -110,7 +110,18 @@ func usage() {
 
 --as <account>   load .env.<account> instead of .env, and namespace this
                  account's runtime state (inbox, cursor, pidfile) so it can
-                 share a directory with the default account.`)
+                 share a directory with the default account.
+
+connection (.env):
+  XMPP_JID, XMPP_PASSWORD          required account credentials
+  XMPP_SERVER                      optional host:port override; defaults to
+                                   <domain>:5222
+  XMPP_WEBSOCKET_URL               connect via XMPP-over-WebSocket (RFC 7395)
+                                   instead of raw TCP, e.g.
+                                   wss://chat.example.com/ws — useful when 5222
+                                   is blocked but 443 is open
+  HTTPS_PROXY / HTTP_PROXY         tunnel the connection through an HTTP CONNECT
+                                   proxy (standard Go env vars)`)
 }
 
 // extractAccountFlag scans args for a leading "--as <name>" or "--as=<name>"
