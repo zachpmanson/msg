@@ -1,10 +1,11 @@
 .env
 .env.*
-msg
+/msg
 inbox*.jsonl
 seen_ids*.jsonl
 .inbox*.cursor
 .listen*.pid
+listen*.log
 last_seen_time*
 next_poll_due*
 downloads.*/

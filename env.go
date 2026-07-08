@@ -144,9 +144,10 @@ func dataDir() string {
 }
 
 // envDir locates the directory holding .env, checking the current working
-// directory first, then the running binary's directory, then ~/projects/msg,
-// so the tool works whether invoked via `go run`, a built binary on PATH, or
-// from an unrelated cwd.
+// directory first, then the running binary's directory, then the XDG config
+// dir (~/.config/msg), then ~/projects/msg, so the tool works whether invoked
+// via `go run`, a built binary on PATH, or from an unrelated cwd. This is the
+// discovery used when MSG_DIR is unset; MSG_DIR overrides all of it.
 func envDir() string {
 	if wd, err := os.Getwd(); err == nil {
 		if _, err := os.Stat(filepath.Join(wd, ".env")); err == nil {
@@ -159,6 +160,15 @@ func envDir() string {
 			return dir
 		}
 	}
+	// XDG config dir: ~/.config/msg (or $XDG_CONFIG_HOME/msg). This is the
+	// intended home for the global install — config decoupled from any dev
+	// checkout — and is checked before the ~/projects/msg fallback so a
+	// stray checkout can't shadow it.
+	if dir := xdgConfigDir(); dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
+			return dir
+		}
+	}
 	if home, err := os.UserHomeDir(); err == nil {
 		dir := filepath.Join(home, "projects", "msg")
 		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
@@ -167,4 +177,17 @@ func envDir() string {
 	}
 	wd, _ := os.Getwd()
 	return wd
+}
+
+// xdgConfigDir returns the msg config directory under the XDG base dir spec:
+// $XDG_CONFIG_HOME/msg if set, else ~/.config/msg. Returns "" if the home
+// directory can't be determined and XDG_CONFIG_HOME is unset.
+func xdgConfigDir() string {
+	if base := os.Getenv("XDG_CONFIG_HOME"); base != "" {
+		return filepath.Join(base, "msg")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".config", "msg")
+	}
+	return ""
 }

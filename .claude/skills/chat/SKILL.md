@@ -1,1 +1,0 @@
-/nix/store/0pfkf3abl6r13457mqgj632445md39a6-home-manager-files/.claude/skills/chat/SKILL.md
