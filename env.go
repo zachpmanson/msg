@@ -143,20 +143,25 @@ func dataDir() string {
 	return envDir()
 }
 
-// envDir locates the directory holding .env, checking the current working
+// envDir locates the directory holding the .env, checking the current working
 // directory first, then the running binary's directory, then the XDG config
 // dir (~/.config/msg), then ~/projects/msg, so the tool works whether invoked
 // via `go run`, a built binary on PATH, or from an unrelated cwd. This is the
 // discovery used when MSG_DIR is unset; MSG_DIR overrides all of it.
+//
+// A directory qualifies if it contains the env file this invocation will
+// actually load — ".env.<account>" under --as, else ".env". (A dir holding
+// only ".env" also qualifies under --as, so shared API creds still resolve.)
+// Keying on the account file matters for persona-only setups that have no
+// plain ".env" at all.
 func envDir() string {
 	if wd, err := os.Getwd(); err == nil {
-		if _, err := os.Stat(filepath.Join(wd, ".env")); err == nil {
+		if dirHasEnv(wd) {
 			return wd
 		}
 	}
 	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
-		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
+		if dir := filepath.Dir(exe); dirHasEnv(dir) {
 			return dir
 		}
 	}
@@ -164,19 +169,31 @@ func envDir() string {
 	// intended home for the global install — config decoupled from any dev
 	// checkout — and is checked before the ~/projects/msg fallback so a
 	// stray checkout can't shadow it.
-	if dir := xdgConfigDir(); dir != "" {
-		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
-			return dir
-		}
+	if dir := xdgConfigDir(); dir != "" && dirHasEnv(dir) {
+		return dir
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		dir := filepath.Join(home, "projects", "msg")
-		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
+		if dir := filepath.Join(home, "projects", "msg"); dirHasEnv(dir) {
 			return dir
 		}
 	}
 	wd, _ := os.Getwd()
 	return wd
+}
+
+// dirHasEnv reports whether dir contains the env file this invocation would
+// load: the account-specific ".env.<account>" when --as is set, or a plain
+// ".env" (also accepted under --as, for shared XMPP_API_* register creds).
+func dirHasEnv(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, envFileName())); err == nil {
+		return true
+	}
+	if account != "" {
+		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // xdgConfigDir returns the msg config directory under the XDG base dir spec:
