@@ -155,6 +155,14 @@ func dataDir() string {
 // Keying on the account file matters for persona-only setups that have no
 // plain ".env" at all.
 func envDir() string {
+	// XDG config dir: ~/.config/msg (or $XDG_CONFIG_HOME/msg). This is the
+	// intended home for the global install — config decoupled from any dev
+	// checkout — and is checked first so a stray ".env"/".env.<account>" left
+	// in whatever directory msg happens to be invoked from can't shadow the
+	// real stored account config.
+	if dir := xdgConfigDir(); dir != "" && dirHasEnv(dir) {
+		return dir
+	}
 	if wd, err := os.Getwd(); err == nil {
 		if dirHasEnv(wd) {
 			return wd
@@ -164,13 +172,6 @@ func envDir() string {
 		if dir := filepath.Dir(exe); dirHasEnv(dir) {
 			return dir
 		}
-	}
-	// XDG config dir: ~/.config/msg (or $XDG_CONFIG_HOME/msg). This is the
-	// intended home for the global install — config decoupled from any dev
-	// checkout — and is checked before the ~/projects/msg fallback so a
-	// stray checkout can't shadow it.
-	if dir := xdgConfigDir(); dir != "" && dirHasEnv(dir) {
-		return dir
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		if dir := filepath.Join(home, "projects", "msg"); dirHasEnv(dir) {
