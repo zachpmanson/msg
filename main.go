@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -97,8 +98,10 @@ func usage() {
                                  provision a new persona account via ejabberd's
                                  HTTP Admin API (needs XMPP_API_URL/USER/PASSWORD
                                  in .env) and write .env.<name> with its creds
-  msg listen                    run the background daemon that logs incoming messages
-                                 (also joins XMPP_ROOM, if set)
+  msg listen                    run the daemon that logs incoming messages in the
+                                 foreground (also joins XMPP_ROOM, if set)
+  msg listen --background        run the listen daemon detached; it outlives the
+                                 shell and logs to listen.log (alias: -b)
   msg check                     print unread messages received since the last check
   msg check --since <ts|date>   one-shot: print messages since an RFC3339 timestamp
                                  or YYYY-MM-DD date, instead of the persisted cursor
@@ -847,16 +850,72 @@ func loadSeenIDs(path string) (map[string]bool, error) {
 	return seen, nil
 }
 
-func cmdListen(args []string) error {
-	cfg, err := loadConfig()
+// spawnListenBackground re-execs this binary as a detached `msg listen`
+// process, so the daemon keeps running after the launching shell exits. The
+// child's stdout/stderr are redirected to listen.log in the state directory.
+func spawnListenBackground() error {
+	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
+
+	childArgs := []string{}
+	if account != "" {
+		childArgs = append(childArgs, "--as", account)
+	}
+	childArgs = append(childArgs, "listen")
+
+	logPath, _ := dataFile("listen.log")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+
+	cmd := exec.Command(self, childArgs...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start background daemon: %w", err)
+	}
+	// Detach: don't wait on the child, let it outlive us.
+	if err := cmd.Process.Release(); err != nil {
+		return err
+	}
+
+	fmt.Printf("listen daemon started in background (pid %d); logging to %s\n", cmd.Process.Pid, logPath)
+	fmt.Println("check status with `msg status`, stop with `msg stop`")
+	return nil
+}
+
+func cmdListen(args []string) error {
+	background := false
+	rest := args[:0]
+	for _, a := range args {
+		switch a {
+		case "--background", "-b":
+			background = true
+		default:
+			rest = append(rest, a)
+		}
+	}
+	args = rest
 
 	pidPath, _ := dataFile(".listen.pid")
 	if pid, ok := runningPID(pidPath); ok {
 		return fmt.Errorf("listen daemon already running (pid %d); run `msg stop` first", pid)
 	}
+
+	if background {
+		return spawnListenBackground()
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
 		return err
 	}
