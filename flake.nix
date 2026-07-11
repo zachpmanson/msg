@@ -14,5 +14,13 @@
         in {
           default = pkgs.callPackage ./package.nix { };
         });
+
+      devShells = forAllSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          default = pkgs.mkShell {
+            packages = [ pkgs.go ];
+          };
+        });
     };
 }

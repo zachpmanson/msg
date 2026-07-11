@@ -10,3 +10,6 @@ last_seen_time*
 next_poll_due*
 downloads.*/
 !.env.example
+
+# direnv
+.direnv/
