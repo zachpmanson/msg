@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	xnetws "golang.org/x/net/websocket"
@@ -1166,24 +1167,45 @@ func fetchDirectHistorySince(ctx context.Context, cfg *Config, since time.Time) 
 		return nil, err
 	}
 
-	h := history.NewHandler(nil)
-	m := mux.New(stanza.NSClient, history.Handle(h))
+	// Collect archive results inside the Serve read-loop rather than via
+	// history.Handler's Fetch iterator. The iterator hands the live session
+	// reader to the consuming goroutine while Serve keeps reading the same
+	// stream to drain the stanza, so two goroutines read the one xml.Decoder
+	// at once and corrupt its buffer offsets — the "slice bounds out of range"
+	// panic. Reading each result here, in the goroutine that runs Serve, keeps
+	// all stream reads on a single goroutine.
+	var (
+		mu  sync.Mutex
+		out []incoming
+	)
+	m := mux.New(stanza.NSClient, mux.MessageFunc(
+		stanza.NormalMessage,
+		xml.Name{Space: history.NS, Local: "result"},
+		func(_ stanza.Message, r xmlstream.TokenReadEncoder) error {
+			toks, err := xmlstream.ReadAll(r)
+			if err != nil {
+				return err
+			}
+			if msg := parseForwardedMessage(toks); msg != nil {
+				mu.Lock()
+				out = append(out, *msg)
+				mu.Unlock()
+			}
+			return nil
+		},
+	))
 	go func() {
 		_ = session.Serve(m)
 	}()
 
-	iter := h.Fetch(ctx, history.Query{With: withJID, Start: since}, accountJID.Bare(), session)
-	defer iter.Close()
-
-	var out []incoming
-	for iter.Next() {
-		toks, err := xmlstream.ReadAll(iter.Current())
-		if err != nil {
-			continue
-		}
-		if m := parseForwardedMessage(toks); m != nil {
-			out = append(out, *m)
-		}
+	// Fetch sends the MAM query and blocks until the archive's IQ result
+	// arrives; the server delivers every result <message> ahead of that IQ, so
+	// by the time this returns the handler above has collected them all.
+	if _, err := history.Fetch(ctx, history.Query{With: withJID, Start: since}, accountJID.Bare(), session); err != nil {
+		return nil, err
 	}
-	return out, iter.Err()
+
+	mu.Lock()
+	defer mu.Unlock()
+	return out, nil
 }
