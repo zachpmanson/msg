@@ -157,6 +157,10 @@ func extractAccountFlag(args []string) ([]string, error) {
 }
 
 func cmdSend(args []string) error {
+	if len(args) >= 1 && (args[0] == "--help" || args[0] == "-h") {
+		fmt.Fprintln(os.Stderr, "usage: msg send \"<text>\" [to-jid]")
+		return nil
+	}
 	if len(args) < 1 {
 		return fmt.Errorf("usage: msg send \"<text>\" [to-jid]")
 	}
