@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRegisterSavesSelectedConfigFormat(t *testing.T) {
@@ -92,7 +93,9 @@ func TestJSONRegistrationRecovery(t *testing.T) {
 			t.Cleanup(func() { os.Chmod(configDir, 0700) })
 			calls := 0
 			generated := ""
+			handled := make(chan struct{})
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(handled)
 				calls++
 				var request map[string]string
 				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -133,6 +136,15 @@ func TestJSONRegistrationRecovery(t *testing.T) {
 				}
 			}
 			err := cmdRegister([]string{"newbot"})
+			if outcome != "preflight failure" {
+				// A hijacked connection can close before its handler returns.
+				// Synchronize captured request fields before inspecting them.
+				select {
+				case <-handled:
+				case <-time.After(5 * time.Second):
+					t.Fatal("registration handler did not finish")
+				}
+			}
 			if outcome == "success" && err != nil || outcome != "success" && err == nil {
 				t.Fatalf("unexpected result: %v", err)
 			}
