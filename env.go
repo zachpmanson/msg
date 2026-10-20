@@ -189,7 +189,7 @@ func envDir() string {
 // invocation would load: ".env.<account>" when --as is set, or a plain
 // ".env" (also accepted under --as, for shared XMPP_API_* register creds).
 func dirHasEnv(dir string) bool {
-	if _, err := os.Stat(filepath.Join(dir, "config.json")); !os.IsNotExist(err) {
+	if _, err := os.Lstat(filepath.Join(dir, "config.json")); !os.IsNotExist(err) {
 		return true // include unreadable configs so errors cannot trigger fallback
 	}
 	if _, err := os.Stat(filepath.Join(dir, envFileName())); err == nil {

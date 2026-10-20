@@ -68,8 +68,9 @@ order:
 5. `~/projects/msg`.
 
 The first qualifying directory wins. Within it, JSON is authoritative: no
-per-account merging or fallback to dotenv when JSON is present, malformed, or
-missing a requested account. If there is **no JSON file**, the original `.env`
+per-account merging or fallback to dotenv when JSON is present, malformed,
+unreadable, a broken symlink, or missing a requested account. Valid JSON symlinks
+are supported. If there is **no JSON entry**, the original `.env`
 and `.env.<account>` loading behavior is unchanged.
 
 Runtime files stay in the discovered directory. With `MSG_CONFIG`, they default
@@ -106,7 +107,14 @@ this admin resource.
 
 `msg register <name> [password]` adds credentials to the existing JSON accounts
 object when present, preserving other accounts and unknown settings. Existing
-accounts and aliases are not overwritten. The replacement file has mode 0600.
+accounts and aliases are not overwritten. Before contacting the API, msg stages
+the updated JSON in a mode-0600 `.msg-config-*` file beside the config. A local
+preparation failure makes no API request. If provisioning fails (including an
+uncertain remote outcome) or the final rename fails, this recovery file is
+retained and its path is reported, never the password. Keep it protected; verify
+the remote account before retrying, then explicitly recover its credentials or
+install the staged config after checking for intervening edits. Successful
+rename consumes the staged file; the replacement has mode 0600.
 Without JSON, registration still writes `.env.<name>`. Set `owner` (or legacy
 `XMPP_TO`) before sending without an explicit recipient. Configuration updates
 are atomic, but are not locked against simultaneous external writers; serialize

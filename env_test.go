@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -239,5 +240,63 @@ func TestAddJSONAccountPreservesConfig(t *testing.T) {
 	info, err := os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("config permissions = %v, %v", info, err)
+	}
+}
+
+func TestImplicitJSONSymlinks(t *testing.T) {
+	dir := configTestDir(t)
+	writeTestConfig(t, filepath.Join(dir, ".env"), "XMPP_JID=stale@example.com\nXMPP_PASSWORD=old\n")
+	target := filepath.Join(dir, "managed.json")
+	if err := os.Symlink(target, filepath.Join(dir, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("dangling JSON must not select legacy credentials")
+	}
+	writeTestConfig(t, target, `{"accounts":{"default":{"jid":"managed@example.com","password":"s"}}}`)
+	cfg, err := loadConfig()
+	if err != nil || cfg.JID != "managed@example.com" {
+		t.Fatalf("valid JSON symlink = %#v, %v", cfg, err)
+	}
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(target, 0000); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("unreadable JSON target must not select legacy credentials")
+		}
+	}
+}
+
+func TestDanglingXDGJSONDoesNotSelectCWD(t *testing.T) {
+	cwd := configTestDir(t)
+	t.Chdir(cwd)
+	t.Setenv("MSG_DIR", "")
+	writeTestConfig(t, filepath.Join(cwd, ".env"), "XMPP_JID=stale@example.com\nXMPP_PASSWORD=old\n")
+	xdg := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "msg")
+	if err := os.Mkdir(xdg, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing-managed-config", filepath.Join(xdg, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	if dataDir() != xdg {
+		t.Fatalf("selected %s instead of authoritative XDG %s", dataDir(), xdg)
+	}
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("dangling XDG JSON must fail, not select cwd credentials")
+	}
+}
+
+func TestLegacyLFOnlyAndWhitespaceSemantics(t *testing.T) {
+	dir := configTestDir(t)
+	for _, value := range []string{"left\u2028right", "left\u0085right", "left\vright", "left\fright", "left\rright", "\x1csecret\x1f"} {
+		t.Run(fmt.Sprintf("%q", value), func(t *testing.T) {
+			writeTestConfig(t, filepath.Join(dir, ".env"), "XMPP_JID=bot@example.com\r\nXMPP_PASSWORD=\u2003 '"+value+"' \u3000\r\n")
+			cfg, err := loadLegacyConfig()
+			if err != nil || cfg.Password != value {
+				t.Fatalf("legacy password bytes changed: %v", err)
+			}
+		})
 	}
 }

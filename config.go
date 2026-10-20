@@ -40,11 +40,14 @@ func configPath() string {
 // unreadable, and malformed configs never silently select legacy credentials.
 func loadFileConfig() (*FileConfig, error) {
 	path := configPath()
-	raw, err := os.ReadFile(path)
-	if err != nil {
+	if _, err := os.Lstat(path); err != nil {
 		if os.IsNotExist(err) && os.Getenv("MSG_CONFIG") == "" {
 			return nil, nil
 		}
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	var cfg FileConfig
@@ -141,53 +144,70 @@ func loadConfig() (*Config, error) {
 	return cfg, nil
 }
 
-// addJSONAccount preserves other accounts and unknown fields (including any
-// pi-msg-specific settings). The rename keeps readers from seeing partial JSON.
-func addJSONAccount(name string, a AccountConfig) error {
+// stageJSONAccount prepares a protected replacement before any remote side
+// effect. The caller owns the staged file: retain it after uncertain provisioning
+// or commit failures so generated credentials remain recoverable.
+func stageJSONAccount(name string, a AccountConfig) (staged string, err error) {
 	path := configPath()
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
-		return err
+		return "", err
 	}
 	var accounts map[string]json.RawMessage
 	if err := json.Unmarshal(root["accounts"], &accounts); err != nil {
-		return err
+		return "", err
 	}
 	if accounts == nil {
-		return fmt.Errorf("%s must have an accounts object", path)
+		return "", fmt.Errorf("%s must have an accounts object", path)
 	}
 	if _, exists := accounts[name]; exists {
-		return fmt.Errorf("account %q already exists in %s; not overwriting", name, path)
+		return "", fmt.Errorf("account %q already exists in %s; not overwriting", name, path)
 	}
 	entry, err := json.Marshal(a)
 	if err != nil {
-		return err
+		return "", err
 	}
 	accounts[name] = entry
 	root["accounts"], err = json.Marshal(accounts)
 	if err != nil {
-		return err
+		return "", err
 	}
 	raw, err = json.MarshalIndent(root, "", "  ")
 	if err != nil {
-		return err
+		return "", err
 	}
 	f, err := os.CreateTemp(filepath.Dir(path), ".msg-config-*")
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer os.Remove(f.Name())
-	_, writeErr := f.Write(append(raw, '\n'))
+	defer func() {
+		if err != nil {
+			os.Remove(f.Name())
+		}
+	}()
+	if _, err = f.Write(append(raw, '\n')); err == nil {
+		err = f.Sync()
+	}
 	closeErr := f.Close()
-	if writeErr != nil {
-		return writeErr
+	if err != nil {
+		return "", err
 	}
 	if closeErr != nil {
-		return closeErr
+		return "", closeErr
 	}
-	return os.Rename(f.Name(), path)
+	return f.Name(), nil
+}
+
+// addJSONAccount preserves unknown fields and atomically replaces the config.
+func addJSONAccount(name string, a AccountConfig) error {
+	staged, err := stageJSONAccount(name, a)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(staged)
+	return os.Rename(staged, configPath())
 }
