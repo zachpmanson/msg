@@ -26,8 +26,8 @@ import (
 	"mellium.im/xmpp/stanza"
 )
 
-// account holds the name passed via --as, if any. When set, the tool loads
-// ".env.<account>" instead of ".env" and namespaces its runtime state files
+// account holds the name passed via --as (canonicalized for JSON aliases).
+// It selects a JSON account or legacy ".env.<account>" and namespaces state
 // (inbox, cursor, pidfile) so multiple accounts can share one directory
 // without a second binary or a second checkout.
 var account string
@@ -51,6 +51,17 @@ func run() error {
 
 	cmd := args[0]
 	args = args[1:]
+	if cmd != "register" {
+		if err := selectAccount(); err != nil {
+			if cmd != "status" && cmd != "stop" {
+				return err
+			}
+			// Keep pidfile-based recovery available when a running daemon's
+			// config is broken or its account was removed. With no usable
+			// alias mapping, the caller must use its canonical account name.
+			fmt.Fprintf(os.Stderr, "warning: %v; using requested runtime account for %s\n", err, cmd)
+		}
+	}
 
 	switch cmd {
 	case "send":
@@ -97,7 +108,8 @@ func usage() {
   msg register <name> [password]
                                  provision a new persona account via ejabberd's
                                  HTTP Admin API (needs XMPP_API_URL/USER/PASSWORD
-                                 in .env) and write .env.<name> with its creds
+                                 in .env) and save credentials to config.json
+                                 when present, otherwise .env.<name>
   msg listen                    run the daemon that logs incoming messages in the
                                  foreground (also joins XMPP_ROOM, if set)
   msg listen --background        run the listen daemon detached; it outlives the
@@ -111,11 +123,19 @@ func usage() {
   msg status                    show whether the listen daemon is running
   msg stop                      stop the listen daemon
 
---as <account>   load .env.<account> instead of .env, and namespace this
-                 account's runtime state (inbox, cursor, pidfile) so it can
-                 share a directory with the default account.
+--as <account>   select an account from config.json (or legacy .env.<account>)
+                 and namespace its runtime state (inbox, cursor, pidfile).
+                 Without --as, JSON selects "default"; unknown names fail.
 
-connection (.env):
+config.json:     unified {"accounts":{"default":{"jid":"...","password":"..."}}}
+                 optional account fields: owner, service, room, nick,
+                 uploadService, websocketUrl; optional accountAliases object.
+                 MSG_CONFIG selects an explicit JSON file. Otherwise discovery
+                 checks MSG_DIR, XDG config, cwd, binary dir, ~/projects/msg.
+                 Missing implicit JSON falls back to legacy dotenv files.
+                 See README.md for examples and registration behavior.
+
+connection (legacy .env):
   XMPP_JID, XMPP_PASSWORD          required account credentials
   XMPP_SERVER                      optional host:port override; defaults to
                                    <domain>:5222

@@ -83,6 +83,19 @@ func cmdRegister(args []string) error {
 		return fmt.Errorf("register %q: account name must not contain '/', '.', '@', or spaces", name)
 	}
 
+	file, err := loadFileConfig()
+	if err != nil {
+		return err
+	}
+	if file != nil {
+		if _, exists := file.Accounts[name]; exists {
+			return fmt.Errorf("account %q already exists in %s; not overwriting", name, configPath())
+		}
+		if _, exists := file.AccountAliases[name]; exists {
+			return fmt.Errorf("account %q is an alias in %s; not overwriting", name, configPath())
+		}
+	}
+
 	api, err := loadAPIConfig()
 	if err != nil {
 		return err
@@ -102,6 +115,14 @@ func cmdRegister(args []string) error {
 	defer cancel()
 	if err := registerAccount(ctx, api, name, password); err != nil {
 		return err
+	}
+
+	if file != nil {
+		if err := addJSONAccount(name, AccountConfig{JID: name + "@" + api.Host, Password: password}); err != nil {
+			return fmt.Errorf("registered %s@%s but failed to update %s: %w", name, api.Host, configPath(), err)
+		}
+		fmt.Printf("registered %s@%s, updated %s (fill in owner before use)\n", name, api.Host, configPath())
+		return nil
 	}
 
 	envPath := filepath.Join(dataDir(), ".env."+name)

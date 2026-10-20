@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// Config holds the account details loaded from .env.
+// Config holds a resolved account from config.json or a legacy dotenv file.
 type Config struct {
 	JID      string // full JID of the bot account, e.g. bot@example.com
 	Password string
@@ -62,7 +62,7 @@ func envFileName() string {
 	return ".env." + account
 }
 
-func loadConfig() (*Config, error) {
+func loadLegacyConfig() (*Config, error) {
 	path := filepath.Join(dataDir(), envFileName())
 	vals, err := loadEnv(path)
 	if err != nil {
@@ -132,25 +132,28 @@ func loadAPIConfig() (*APIConfig, error) {
 	return cfg, nil
 }
 
-// dataDir returns the directory holding .env and this account's runtime
-// state (inbox.jsonl, cursor, pidfile). MSG_DIR overrides discovery, so one
+// dataDir returns the directory holding this account's runtime state (inbox,
+// cursor, pidfile). MSG_DIR overrides discovery and the MSG_CONFIG parent, so one
 // approved binary can act as multiple accounts (e.g. for self-testing)
 // without spawning a second, unapproved binary path.
 func dataDir() string {
 	if override := os.Getenv("MSG_DIR"); override != "" {
 		return override
 	}
+	if path := os.Getenv("MSG_CONFIG"); path != "" {
+		return filepath.Dir(path)
+	}
 	return envDir()
 }
 
-// envDir locates the directory holding the .env, checking the current working
-// directory first, then the running binary's directory, then the XDG config
-// dir (~/.config/msg), then ~/projects/msg, so the tool works whether invoked
+// envDir locates the directory holding config.json or legacy dotenv files,
+// checking the XDG config dir (~/.config/msg) first, then the current working
+// directory, the running binary's directory, and ~/projects/msg. It works whether invoked
 // via `go run`, a built binary on PATH, or from an unrelated cwd. This is the
 // discovery used when MSG_DIR is unset; MSG_DIR overrides all of it.
 //
-// A directory qualifies if it contains the env file this invocation will
-// actually load — ".env.<account>" under --as, else ".env". (A dir holding
+// A directory qualifies if it contains config.json or the env file this
+// invocation will load — ".env.<account>" under --as, else ".env". (A dir holding
 // only ".env" also qualifies under --as, so shared API creds still resolve.)
 // Keying on the account file matters for persona-only setups that have no
 // plain ".env" at all.
@@ -182,10 +185,13 @@ func envDir() string {
 	return wd
 }
 
-// dirHasEnv reports whether dir contains the env file this invocation would
-// load: the account-specific ".env.<account>" when --as is set, or a plain
+// dirHasEnv reports whether dir contains config.json or the env file this
+// invocation would load: ".env.<account>" when --as is set, or a plain
 // ".env" (also accepted under --as, for shared XMPP_API_* register creds).
 func dirHasEnv(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, "config.json")); !os.IsNotExist(err) {
+		return true // include unreadable configs so errors cannot trigger fallback
+	}
 	if _, err := os.Stat(filepath.Join(dir, envFileName())); err == nil {
 		return true
 	}
