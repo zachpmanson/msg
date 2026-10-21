@@ -476,11 +476,11 @@ func claudePresence() (string, string) {
 	p, _ := dataFile("next_poll_due")
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return "xa", "not actively watched by Claude"
+		return "xa", "not being actively watched"
 	}
 	due, err := time.Parse(time.RFC3339, strings.TrimSpace(string(b)))
 	if err != nil || time.Now().After(due) {
-		return "xa", "not actively watched by Claude"
+		return "xa", "not being actively watched"
 	}
 	return "", "listening for messages"
 }
