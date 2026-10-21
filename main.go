@@ -45,12 +45,17 @@ func run() error {
 		return err
 	}
 	if len(args) < 1 {
-		usage()
+		usage(os.Stderr)
 		return fmt.Errorf("missing command")
 	}
 
 	cmd := args[0]
 	args = args[1:]
+	// Help must work even when account configuration is absent or broken.
+	if cmd == "--help" || cmd == "-h" {
+		usage(os.Stdout)
+		return nil
+	}
 	if cmd != "register" {
 		if err := selectAccount(); err != nil {
 			if cmd != "status" && cmd != "stop" {
@@ -89,14 +94,15 @@ func run() error {
 	case "status":
 		return cmdStatus()
 	default:
-		usage()
+		usage(os.Stderr)
 		return fmt.Errorf("unknown command %q", cmd)
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage:
+func usage(w io.Writer) {
+	fmt.Fprintln(w, `usage:
   msg [--as <account>] <command> ...
+  msg --help                    show this help and exit (alias: -h)
   msg send "<text>" [to-jid]   send a direct message (defaults to XMPP_TO from .env)
   msg room "<text>"             send a groupchat message to XMPP_ROOM
   msg typing [to-jid]           send a "composing" chat state (defaults to XMPP_TO)
