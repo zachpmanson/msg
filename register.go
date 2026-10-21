@@ -83,6 +83,19 @@ func cmdRegister(args []string) error {
 		return fmt.Errorf("register %q: account name must not contain '/', '.', '@', or spaces", name)
 	}
 
+	file, err := loadFileConfig()
+	if err != nil {
+		return err
+	}
+	if file != nil {
+		if _, exists := file.Accounts[name]; exists {
+			return fmt.Errorf("account %q already exists in %s; not overwriting", name, configPath())
+		}
+		if _, exists := file.AccountAliases[name]; exists {
+			return fmt.Errorf("account %q is an alias in %s; not overwriting", name, configPath())
+		}
+	}
+
 	api, err := loadAPIConfig()
 	if err != nil {
 		return err
@@ -100,6 +113,24 @@ func cmdRegister(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	if file != nil {
+		path := configPath()
+		staged, err := stageJSONAccount(name, AccountConfig{JID: name + "@" + api.Host, Password: password})
+		if err != nil {
+			return fmt.Errorf("preparing registration config before provisioning: %w", err)
+		}
+		// Never remove the sole credential artifact after an attempted request:
+		// even an HTTP/transport error can have an ambiguous remote outcome.
+		if err := registerAccount(ctx, api, name, password); err != nil {
+			// Do not include server errors: a response might echo the password.
+			return fmt.Errorf("registration failed or outcome uncertain; recovery config retained at %s (contains credentials; verify remote account before retrying)", staged)
+		}
+		if err := os.Rename(staged, path); err != nil {
+			return fmt.Errorf("registered %s@%s but failed to update %s; recovery config retained at %s (contains credentials)", name, api.Host, path, staged)
+		}
+		fmt.Printf("registered %s@%s, updated %s (fill in owner before use)\n", name, api.Host, path)
+		return nil
+	}
 	if err := registerAccount(ctx, api, name, password); err != nil {
 		return err
 	}

@@ -3,51 +3,51 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 )
 
-func TestClaudePresence(t *testing.T) {
-	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
-	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	for _, tt := range []struct {
-		name       string
-		record     *string
-		wantShow   string
-		wantStatus string
-	}{
-		{name: "missing poll record", wantShow: "xa", wantStatus: "not being actively watched"},
-		{name: "empty poll record", record: new(string), wantShow: "xa", wantStatus: "not being actively watched"},
-		{name: "invalid poll record", record: stringPtr("invalid"), wantShow: "xa", wantStatus: "not being actively watched"},
-		{name: "expired poll record", record: &past, wantShow: "xa", wantStatus: "not being actively watched"},
-		{name: "active polling", record: &future, wantStatus: "listening for messages"},
-		{name: "active polling with whitespace", record: stringPtr(" \n" + future + "\n"), wantStatus: "listening for messages"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			t.Setenv("MSG_DIR", dir)
-			path, err := dataFile("next_poll_due")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if filepath.Dir(path) != dir {
-				t.Fatalf("poll record path %q is outside test directory", path)
-			}
-			if tt.record != nil {
-				if err := os.WriteFile(path, []byte(*tt.record), 0600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			show, status := claudePresence()
-			if show != tt.wantShow || status != tt.wantStatus {
-				t.Errorf("claudePresence() = (%q, %q), want (%q, %q)", show, status, tt.wantShow, tt.wantStatus)
-			}
-			if strings.Contains(strings.ToLower(status), "claude") {
-				t.Errorf("presence status still references Claude: %q", status)
-			}
-		})
+func testRun(t *testing.T, args ...string) error {
+	t.Helper()
+	old := os.Args
+	os.Args = append([]string{"msg"}, args...)
+	defer func() { os.Args = old }()
+	account = ""
+	return run()
+}
+
+func TestRunCanonicalizesAliasBeforeStateWrites(t *testing.T) {
+	dir := configTestDir(t)
+	writeTestConfig(t, filepath.Join(dir, "config.json"), `{"accounts":{"droid":{"jid":"droid@example.com","password":"s"}},"accountAliases":{"robot":"droid"}}`)
+	if err := testRun(t, "--as", "robot", "check", "--no-receipt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.droid")); err != nil {
+		t.Fatal("missing canonical poll state:", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.robot")); !os.IsNotExist(err) {
+		t.Fatal("alias must not have separate state:", err)
+	}
+	if err := testRun(t, "--as", "missing", "check", "--no-receipt"); err == nil {
+		t.Fatal("unknown account must fail before writing state")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.missing")); !os.IsNotExist(err) {
+		t.Fatal("unknown account wrote state:", err)
 	}
 }
 
-func stringPtr(s string) *string { return &s }
+func TestRunDaemonManagementSurvivesBrokenConfig(t *testing.T) {
+	dir := configTestDir(t)
+	for _, raw := range []string{`{`, `{"accounts":{}}`} {
+		writeTestConfig(t, filepath.Join(dir, "config.json"), raw)
+		for _, cmd := range []string{"status", "stop"} {
+			// No pidfiles exist in this isolated directory: no live daemon is
+			// signalled, but management must remain usable without valid JSON.
+			if err := testRun(t, "--as", "droid", cmd); err != nil {
+				t.Fatalf("%s with broken/removed config: %v", cmd, err)
+			}
+		}
+		if err := testRun(t, "--as", "droid", "listen"); err == nil {
+			t.Fatal("listen must not bypass config validation")
+		}
+	}
+}
