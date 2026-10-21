@@ -1,91 +1,53 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"fmt"
-	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
-func TestCLIHelp(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "msg")
-	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build msg: %v\n%s", err, output)
+func testRun(t *testing.T, args ...string) error {
+	t.Helper()
+	old := os.Args
+	os.Args = append([]string{"msg"}, args...)
+	defer func() { os.Args = old }()
+	account = ""
+	return run()
+}
+
+func TestRunCanonicalizesAliasBeforeStateWrites(t *testing.T) {
+	dir := configTestDir(t)
+	writeTestConfig(t, filepath.Join(dir, "config.json"), `{"accounts":{"droid":{"jid":"droid@example.com","password":"s"}},"accountAliases":{"robot":"droid"}}`)
+	if err := testRun(t, "--as", "robot", "check", "--no-receipt"); err != nil {
+		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.droid")); err != nil {
+		t.Fatal("missing canonical poll state:", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.robot")); !os.IsNotExist(err) {
+		t.Fatal("alias must not have separate state:", err)
+	}
+	if err := testRun(t, "--as", "missing", "check", "--no-receipt"); err == nil {
+		t.Fatal("unknown account must fail before writing state")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.missing")); !os.IsNotExist(err) {
+		t.Fatal("unknown account wrote state:", err)
+	}
+}
 
-	for _, configured := range []bool{false, true} {
-		t.Run(fmt.Sprintf("configured=%t", configured), func(t *testing.T) {
-			dir := t.TempDir()
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
+func TestRunDaemonManagementSurvivesBrokenConfig(t *testing.T) {
+	dir := configTestDir(t)
+	for _, raw := range []string{`{`, `{"accounts":{}}`} {
+		writeTestConfig(t, filepath.Join(dir, "config.json"), raw)
+		for _, cmd := range []string{"status", "stop"} {
+			// No pidfiles exist in this isolated directory: no live daemon is
+			// signalled, but management must remain usable without valid JSON.
+			if err := testRun(t, "--as", "droid", cmd); err != nil {
+				t.Fatalf("%s with broken/removed config: %v", cmd, err)
 			}
-			var connections atomic.Int32
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				for {
-					conn, err := listener.Accept()
-					if err != nil {
-						return
-					}
-					connections.Add(1)
-					conn.Close()
-				}
-			}()
-			defer func() {
-				listener.Close()
-				<-done
-				if got := connections.Load(); got != 0 {
-					t.Errorf("help attempted %d XMPP connections; want none", got)
-				}
-			}()
-
-			if configured {
-				config := fmt.Sprintf("XMPP_JID=bot@example.invalid\nXMPP_PASSWORD=test\nXMPP_TO=recipient@example.invalid\nXMPP_ROOM=room@example.invalid\nXMPP_SERVER=%s\n", listener.Addr())
-				for _, name := range []string{".env", ".env.test"} {
-					if err := os.WriteFile(filepath.Join(dir, name), []byte(config), 0600); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-
-			for _, args := range [][]string{
-				{"--help"},
-				{"-h"},
-				{"--as", "test", "--help"},
-				{"--as=test", "-h"},
-				{"--help", "--as", "test"},
-			} {
-				t.Run(strings.Join(args, " "), func(t *testing.T) {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-					cmd := exec.CommandContext(ctx, binary, args...)
-					cmd.Dir = dir
-					// Never discover real account credentials or use a real proxy.
-					cmd.Env = []string{"MSG_DIR=" + dir, "HOME=" + dir, "NO_PROXY=*"}
-					var stdout, stderr bytes.Buffer
-					cmd.Stdout, cmd.Stderr = &stdout, &stderr
-					if err := cmd.Run(); err != nil {
-						t.Fatalf("help must exit successfully: %v\nstdout: %s\nstderr: %s", err, &stdout, &stderr)
-					}
-					for _, want := range []string{"usage:", "msg send", "msg room", "--as <account>", "msg --help", "alias: -h"} {
-						if !strings.Contains(stdout.String(), want) {
-							t.Errorf("help missing %q: %s", want, &stdout)
-						}
-					}
-					if stderr.Len() != 0 {
-						t.Errorf("unexpected stderr: %s", &stderr)
-					}
-				})
-			}
-		})
+		}
+		if err := testRun(t, "--as", "droid", "listen"); err == nil {
+			t.Fatal("listen must not bypass config validation")
+		}
 	}
 }

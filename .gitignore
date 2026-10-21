@@ -1,6 +1,8 @@
 .env
 .env.*
 /msg
+/config.json
+.msg-config-*
 inbox*.jsonl
 seen_ids*.jsonl
 .inbox*.cursor
