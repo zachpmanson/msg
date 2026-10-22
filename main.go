@@ -23,7 +23,6 @@ import (
 
 	"mellium.im/xmlstream"
 	"mellium.im/xmpp"
-	"mellium.im/xmpp/stanza"
 )
 
 // account holds the name passed via --as (canonicalized for JSON aliases).
@@ -1020,11 +1019,8 @@ func cmdListen(args []string) error {
 				return
 			}
 			announced = true
+			// Room listeners join silently; keep the announcement for direct chats only.
 			if cfg.Room != "" {
-				time.Sleep(500 * time.Millisecond)
-				if _, err := encodeMessage(ctx, session, cfg.Room, "listening for your replies now.", stanza.GroupChatMessage); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to send listening announcement: %v\n", err)
-				}
 				return
 			}
 			if cfg.To == "" {
