@@ -38,7 +38,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (err error) {
 	args, err := extractAccountFlag(os.Args[1:])
 	if err != nil {
 		return err
@@ -66,6 +66,16 @@ func run() error {
 			fmt.Fprintf(os.Stderr, "warning: %v; using requested runtime account for %s\n", err, cmd)
 		}
 	}
+
+	defer func() {
+		if err != nil || (len(args) > 0 && (args[0] == "--help" || args[0] == "-h")) {
+			return
+		}
+		switch cmd {
+		case "send", "room", "typing", "send-file", "room-file", "react":
+			recordActivity(time.Now())
+		}
+	}()
 
 	switch cmd {
 	case "send":
@@ -119,6 +129,7 @@ func usage(w io.Writer) {
                                  foreground (also joins XMPP_ROOM, if set)
   msg listen --background        run the listen daemon detached; it outlives the
                                  shell and logs to listen.log (alias: -b)
+  msg listen --no-last-activity   omit idle presence and refuse last-activity IQs
   msg check                     print unread messages received since the last check
   msg check --since <ts|date>   one-shot: print messages since an RFC3339 timestamp
                                  or YYYY-MM-DD date, instead of the persisted cursor
@@ -460,7 +471,9 @@ func touchLastPoll(inSeconds int) {
 	if inSeconds > 0 {
 		window = time.Duration(inSeconds)*time.Second + defaultPollWindow
 	}
-	due := time.Now().Add(window).UTC().Format(time.RFC3339)
+	now := time.Now()
+	recordActivity(now)
+	due := now.Add(window).UTC().Format(time.RFC3339)
 	p, _ := dataFile("next_poll_due")
 	if err := os.WriteFile(p, []byte(due), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not record next poll time: %v\n", err)
@@ -882,7 +895,7 @@ func loadSeenIDs(path string) (map[string]bool, error) {
 // spawnListenBackground re-execs this binary as a detached `msg listen`
 // process, so the daemon keeps running after the launching shell exits. The
 // child's stdout/stderr are redirected to listen.log in the state directory.
-func spawnListenBackground() error {
+func spawnListenBackground(listenArgs []string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -893,6 +906,7 @@ func spawnListenBackground() error {
 		childArgs = append(childArgs, "--as", account)
 	}
 	childArgs = append(childArgs, "listen")
+	childArgs = append(childArgs, listenArgs...)
 
 	logPath, _ := dataFile("listen.log")
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -930,6 +944,13 @@ func cmdListen(args []string) error {
 		}
 	}
 	args = rest
+	activityEnabled := true
+	for _, a := range args {
+		if a != "--no-last-activity" {
+			return fmt.Errorf("unknown listen argument %q", a)
+		}
+		activityEnabled = false
+	}
 
 	pidPath, _ := dataFile(".listen.pid")
 	if pid, ok := runningPID(pidPath); ok {
@@ -937,7 +958,7 @@ func cmdListen(args []string) error {
 	}
 
 	if background {
-		return spawnListenBackground()
+		return spawnListenBackground(args)
 	}
 
 	cfg, err := loadConfig()
@@ -1009,6 +1030,10 @@ func cmdListen(args []string) error {
 
 	fmt.Printf("listening as %s (Ctrl-C to stop, or `msg stop`)\n", cfg.JID)
 
+	// Retain the fallback across connection attempts: reconnecting is not
+	// user activity. Persisted activity from another invocation takes priority.
+	started := time.Now()
+	activityFn := func() time.Time { return lastActivity(started, time.Now()) }
 	announced := false
 	backoff := time.Second
 	for {
@@ -1029,7 +1054,7 @@ func cmdListen(args []string) error {
 			if err := sendOnSession(ctx, session, cfg.To, "listening for your replies now."); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to send listening announcement: %v\n", err)
 			}
-		}, claudePresence)
+		}, claudePresence, activityFn, activityEnabled)
 		if ctx.Err() != nil {
 			return nil
 		}

@@ -27,11 +27,20 @@ func TestRunCanonicalizesAliasBeforeStateWrites(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.robot")); !os.IsNotExist(err) {
 		t.Fatal("alias must not have separate state:", err)
 	}
+	if _, err := os.Stat(filepath.Join(dir, "last_activity.droid")); err != nil {
+		t.Fatal("missing canonical activity clock:", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "last_activity.robot")); !os.IsNotExist(err) {
+		t.Fatal("alias must not have a separate activity clock:", err)
+	}
 	if err := testRun(t, "--as", "missing", "check", "--no-receipt"); err == nil {
 		t.Fatal("unknown account must fail before writing state")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "next_poll_due.missing")); !os.IsNotExist(err) {
 		t.Fatal("unknown account wrote state:", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "last_activity.missing")); !os.IsNotExist(err) {
+		t.Fatal("unknown account wrote activity:", err)
 	}
 }
 

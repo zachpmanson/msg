@@ -316,18 +316,17 @@ func sendRoomMessage(ctx context.Context, cfg *Config, body string) error {
 	return err
 }
 
-// sendPresence announces availability with a show state (e.g. "" for
-// available, "xa" for extended-away) and a human-readable status, so a
-// contact's roster shows more than just "online" — e.g. distinguishing the
-// daemon actually running from some other client being briefly connected,
-// or whether an agent is actively polling it right now.
-func sendPresence(ctx context.Context, session *xmpp.Session, show, status string) error {
-	p := struct {
-		XMLName xml.Name `xml:"presence"`
-		Show    string   `xml:"show,omitempty"`
-		Status  string   `xml:"status"`
-	}{Show: show, Status: status}
-	return session.Encode(ctx, p)
+type presencePayload struct {
+	XMLName xml.Name      `xml:"presence"`
+	Show    string        `xml:"show,omitempty"`
+	Status  string        `xml:"status"`
+	Idle    *idlePresence `xml:"idle,omitempty"`
+}
+
+// sendPresence announces availability with a show state, human-readable
+// status, and optional XEP-0319 idle timestamp for contacts' rosters.
+func sendPresence(ctx context.Context, session *xmpp.Session, show, status string, idle *idlePresence) error {
+	return session.Encode(ctx, presencePayload{Show: show, Status: status, Idle: idle})
 }
 
 // approveSubscription auto-accepts a presence subscription request so a
@@ -535,8 +534,10 @@ const presenceRefresh = 20 * time.Second
 // If presenceFn is non-nil, it's called immediately and then every
 // presenceRefresh to decide the current (show, status) to announce — this is
 // how presence tracks whether an agent is actively polling `msg check`
-// rather than just whether the daemon process is up.
-func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected func(*xmpp.Session), presenceFn func() (show, status string)) error {
+// rather than just whether the daemon process is up. activityFn supplies the
+// same clock for idle presence and last-activity IQs; activityEnabled disables
+// both disclosures when false.
+func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected func(*xmpp.Session), presenceFn func() (show, status string), activityFn func() time.Time, activityEnabled bool) error {
 	session, _, err := connect(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -550,6 +551,16 @@ func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected 
 	connCtx, cancelConn := context.WithCancel(ctx)
 	defer cancelConn()
 
+	currentActivity := func() time.Time {
+		if activityFn != nil {
+			return activityFn()
+		}
+		return time.Time{}
+	}
+	currentIdle := func() *idlePresence {
+		return idleElement(currentActivity(), time.Now(), activityEnabled)
+	}
+
 	show, status := "", "listening for messages"
 	if presenceFn != nil {
 		show, status = presenceFn()
@@ -557,10 +568,10 @@ func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected 
 	// Announce availability (with a status so it's clear in a client's roster
 	// that this is the daemon, not just a bare online blip) so the server
 	// delivers messages to this resource.
-	if err := sendPresence(ctx, session, show, status); err != nil {
+	if err := sendPresence(ctx, session, show, status, currentIdle()); err != nil {
 		return fmt.Errorf("sending presence: %w", err)
 	}
-	if presenceFn != nil {
+	if presenceFn != nil || activityFn != nil {
 		go func() {
 			ticker := time.NewTicker(presenceRefresh)
 			defer ticker.Stop()
@@ -569,8 +580,11 @@ func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected 
 				case <-connCtx.Done():
 					return
 				case <-ticker.C:
-					show, status := presenceFn()
-					if err := sendPresence(ctx, session, show, status); err != nil {
+					refreshShow, refreshStatus := show, status
+					if presenceFn != nil {
+						refreshShow, refreshStatus = presenceFn()
+					}
+					if err := sendPresence(ctx, session, refreshShow, refreshStatus, currentIdle()); err != nil {
 						fmt.Fprintf(os.Stderr, "failed to refresh presence: %v\n", err)
 						return
 					}
@@ -592,6 +606,9 @@ func listen(ctx context.Context, cfg *Config, onMsg func(incoming), onConnected 
 	done := make(chan error, 1)
 	go func() {
 		done <- session.Serve(xmpp.HandlerFunc(func(t xmlstream.TokenReadEncoder, start *xml.StartElement) error {
+			if start.Name.Local == "iq" {
+				return handleActivityIQ(t, start, session.LocalAddr(), currentActivity(), time.Now(), activityEnabled)
+			}
 			if start.Name.Local == "presence" {
 				_, err := xmlstream.Copy(xmlstream.Discard(), t)
 				if err != nil {
