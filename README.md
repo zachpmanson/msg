@@ -120,6 +120,51 @@ Without JSON, registration still writes `.env.<name>`. Set `owner` (or legacy
 are atomic, but are not locked against simultaneous external writers; serialize
 registration/config edits.
 
+## Idle presence and last activity
+
+The listen daemon supports [XEP-0319](https://xmpp.org/extensions/xep-0319.html)
+idle presence and [XEP-0012](https://xmpp.org/extensions/xep-0012.html)
+last-activity queries for its **online full JID** (including the bound resource).
+It advertises `jabber:iq:last` in disco#info responses.
+
+- `msg check` and successful `send`, `room`, `typing`, `send-file`, `room-file`,
+  and `react` commands record actual activity in the account-scoped
+  `last_activity` runtime file (aliases share the canonical account's clock).
+- After 180 seconds without activity, presence includes
+  `<idle xmlns="urn:xmpp:idle:1" since="…"/>`, using the last activity's UTC
+  timestamp. The next presence refresh (every 20 seconds) removes it after
+  renewed activity. Refreshes retain the original `since` value.
+- `msg check --in` controls the existing available/extended-away poll status,
+  **not** the activity timestamp. An available resource can still be idle.
+- An online-resource IQ-get with `<query xmlns="jabber:iq:last"/>` returns
+  elapsed whole seconds from the same clock. Receiving messages, automatic
+  receipts/announcements, background traffic, and reconnects do not reset it.
+- If no valid activity record exists (including invalid/future records), the
+  daemon uses its startup time, retained across reconnects. This is a CLI/agent
+  activity clock, not an operating-system keyboard/mouse idle monitor.
+
+### Privacy and server requirements
+
+Use `msg listen --no-last-activity` (also with `--background`) to disable
+**both** idle presence and last-activity responses for this listener. Queries
+then receive `service-unavailable`, and disco no longer advertises the feature.
+Restart the daemon with the flag to change an already-running listener.
+
+**The XMPP server MUST enforce presence subscriptions, privacy lists
+(XEP-0016), and blocking (XEP-0191) before forwarding last-activity queries,
+including queries to full JIDs.** Unauthorized queries must not reach msg;
+XEP-0012 specifies `forbidden` for lack of presence authorization. The client
+relies on this server boundary; it cannot infer those permissions from a
+sender's JID or shared MUC membership. The existing automatic acceptance of
+incoming presence subscriptions is unchanged: use server privacy/blocking
+controls or the listener opt-out if you do not want to share activity.
+
+msg does not provide offline last-seen, server uptime, or bare-JID last-activity
+answers; these belong to the server. Check your server's enforcement before
+enabling sharing on an account. Local tests cover client emission, request/
+response framing, opt-out, and errors; they do not certify a live server's
+subscription/privacy/blocking configuration.
+
 ## Development
 
 ```sh
