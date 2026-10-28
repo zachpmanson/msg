@@ -6,6 +6,8 @@ Supports:
 - multi-user chats
 - presence status
 - read reciepts
+- reactions
+- file uploads
 - whitelisting JIDs
 - multiple accounts
 - JSON structured output
